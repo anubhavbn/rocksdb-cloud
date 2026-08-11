@@ -53,6 +53,64 @@ class FlushedFileCollector : public EventListener {
   std::mutex mutex_;
 };
 
+class SstMetadataRecordingFileSystem : public FileSystemWrapper {
+ public:
+  struct OpenRecord {
+    uint64_t file_number;
+    std::string file_name;
+    bool status_ok;
+    bool status_path_not_found;
+    std::optional<SstFileMetadata> metadata;
+  };
+
+  explicit SstMetadataRecordingFileSystem(const std::shared_ptr<FileSystem>& fs)
+      : FileSystemWrapper(fs) {}
+
+  static const char* kClassName() { return "SstMetadataRecordingFileSystem"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    auto status = target()->NewRandomAccessFile(fname, opts, result, dbg);
+
+    auto file_name = GetFileName(fname);
+    uint64_t file_number;
+    FileType file_type;
+    if (ParseFileName(file_name, &file_number, &file_type) &&
+        file_type == kTableFile) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      opens_.push_back({file_number, std::move(file_name), status.ok(),
+                        status.IsPathNotFound(), opts.sst_file_metadata});
+    }
+
+    return status;
+  }
+
+  std::vector<OpenRecord> GetOpenRecords() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return opens_;
+  }
+
+  void ClearOpenRecords() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    opens_.clear();
+  }
+
+ private:
+  static std::string GetFileName(const std::string& fname) {
+    auto last_separator = fname.find_last_of("/\\");
+    if (last_separator == std::string::npos) {
+      return fname;
+    }
+    return fname.substr(last_separator + 1);
+  }
+
+  mutable std::mutex mutex_;
+  std::vector<OpenRecord> opens_;
+};
+
 TEST_F(DBSSTTest, DontDeletePendingOutputs) {
   Options options;
   options.env = env_;
@@ -131,6 +189,109 @@ TEST_F(DBSSTTest, SSTsWithLdbSuffixHandling) {
   for (int k = 0; k < key_id; ++k) {
     ASSERT_EQ(values[k], Get(Key(k)));
   }
+  Destroy(options);
+}
+
+TEST_F(DBSSTTest, PassesSstMetadataToFileSystem) {
+  auto fs =
+      std::make_shared<SstMetadataRecordingFileSystem>(env_->GetFileSystem());
+  auto test_env = std::make_unique<CompositeEnvWrapper>(env_, fs);
+
+  Options options = CurrentOptions();
+  options.env = test_env.get();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::vector<std::string> filenames;
+  GetSstFiles(env_, dbname_, &filenames);
+  ASSERT_EQ(filenames.size(), 1);
+
+  uint64_t file_number;
+  FileType file_type;
+  ASSERT_TRUE(ParseFileName(filenames[0], &file_number, &file_type));
+  ASSERT_EQ(file_type, kTableFile);
+
+  auto findFileMeta = [&]() -> const FileMetaData* {
+    auto* cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const auto* storage_info = cfd->current()->storage_info();
+    for (int level = 0; level < storage_info->num_levels(); ++level) {
+      for (const auto* file_meta : storage_info->LevelFiles(level)) {
+        if (file_meta->fd.GetNumber() == file_number) {
+          return file_meta;
+        }
+      }
+    }
+    return nullptr;
+  };
+
+  auto expectMetadata = [&](const FileMetaData& file_meta) {
+    auto records = fs->GetOpenRecords();
+    size_t matching_records = 0;
+    for (const auto& record : records) {
+      if (record.file_number != file_number) {
+        continue;
+      }
+      ++matching_records;
+      EXPECT_TRUE(record.metadata.has_value()) << record.file_name;
+      if (!record.metadata) {
+        continue;
+      }
+      EXPECT_EQ(record.metadata->file_size, file_meta.fd.GetFileSize());
+      EXPECT_EQ(record.metadata->tail_size, file_meta.tail_size);
+    }
+    EXPECT_GT(matching_records, 0);
+    return records;
+  };
+
+  fs->ClearOpenRecords();
+  Reopen(options);
+  ASSERT_EQ(Get("key"), "value");
+
+  const auto* file_meta = findFileMeta();
+  ASSERT_NE(file_meta, nullptr);
+  ASSERT_GT(file_meta->tail_size, 0);
+  auto records = expectMetadata(*file_meta);
+  bool saw_successful_sst_open = false;
+  for (const auto& record : records) {
+    if (record.file_number == file_number && record.file_name == filenames[0] &&
+        record.status_ok) {
+      saw_successful_sst_open = true;
+    }
+  }
+  EXPECT_TRUE(saw_successful_sst_open);
+  Close();
+
+  const auto sst_name = dbname_ + "/" + filenames[0];
+  const auto ldb_name = Rocks2LevelTableFileName(sst_name);
+  const auto ldb_file_name = Rocks2LevelTableFileName(filenames[0]);
+  ASSERT_OK(env_->RenameFile(sst_name, ldb_name));
+
+  fs->ClearOpenRecords();
+  Reopen(options);
+  ASSERT_EQ(Get("key"), "value");
+
+  file_meta = findFileMeta();
+  ASSERT_NE(file_meta, nullptr);
+  records = expectMetadata(*file_meta);
+  bool saw_failed_sst_open = false;
+  bool saw_successful_ldb_open = false;
+  for (const auto& record : records) {
+    if (record.file_number != file_number) {
+      continue;
+    }
+    if (record.file_name == filenames[0] && record.status_path_not_found) {
+      saw_failed_sst_open = true;
+    }
+    if (record.file_name == ldb_file_name && record.status_ok) {
+      saw_successful_ldb_open = true;
+    }
+  }
+  EXPECT_TRUE(saw_failed_sst_open);
+  EXPECT_TRUE(saw_successful_ldb_open);
+
   Destroy(options);
 }
 

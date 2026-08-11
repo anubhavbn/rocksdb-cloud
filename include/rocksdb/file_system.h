@@ -24,6 +24,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -177,6 +178,14 @@ struct DirFsyncOptions {
 // File scope options that control how a file is opened/created and accessed
 // while its open. We may add more options here in the future such as
 // redundancy level, media to use etc.
+struct SstFileMetadata {
+  // The logical size of the full SST file.
+  uint64_t file_size = 0;
+
+  // The size of the metadata tail at the end of the SST file.
+  uint64_t tail_size = 0;
+};
+
 struct FileOptions : EnvOptions {
   // Embedded IOOptions to control the parameters for any IOs that need
   // to be issued for the file open/creation
@@ -193,6 +202,10 @@ struct FileOptions : EnvOptions {
   // handoff during file writes.
   ChecksumType handoff_checksum_type;
 
+  // Metadata reconstructed from MANIFEST for an SST table file open. This is
+  // unset for non-SST file opens and SST opens without MANIFEST metadata.
+  std::optional<SstFileMetadata> sst_file_metadata;
+
   FileOptions() : EnvOptions(), handoff_checksum_type(ChecksumType::kCRC32c) {}
 
   FileOptions(const DBOptions& opts)
@@ -205,7 +218,8 @@ struct FileOptions : EnvOptions {
       : EnvOptions(opts),
         io_options(opts.io_options),
         temperature(opts.temperature),
-        handoff_checksum_type(opts.handoff_checksum_type) {}
+        handoff_checksum_type(opts.handoff_checksum_type),
+        sst_file_metadata(opts.sst_file_metadata) {}
 
   FileOptions& operator=(const FileOptions&) = default;
 };

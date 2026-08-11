@@ -1615,8 +1615,12 @@ Status Version::GetTableProperties(const ReadOptions& read_options,
     file_name = TableFileName(ioptions->cf_paths, file_meta->fd.GetNumber(),
                               file_meta->fd.GetPathId());
   }
-  s = ioptions->fs->NewRandomAccessFile(file_name, file_options_, &file,
-                                        nullptr);
+  FileOptions fopts = file_options_;
+  fopts.sst_file_metadata = SstFileMetadata{
+      file_meta->fd.GetFileSize(),
+      file_meta->tail_size,
+  };
+  s = ioptions->fs->NewRandomAccessFile(file_name, fopts, &file, nullptr);
   if (!s.ok()) {
     return s;
   }
